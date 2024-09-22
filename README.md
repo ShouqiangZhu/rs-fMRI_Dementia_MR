@@ -1,0 +1,1 @@
+The code is used to produce the results of "Genetic Insights into Bidirectional Causal Relationships Between Brain Functional Networks and Dementia Risk", You can contact sq_zhu_anesth@163.com when you have any questions
