@@ -1,0 +1,168 @@
+### R scripts
+library(mr.raps)
+library(TwoSampleMR)
+library(MRPRESSO)
+library(RadialMR)
+library(ggplot2)
+
+setwd("/rsfMRI-MR")
+exposure_data <- read_exposure_data(file=unzip("ukbiobank_ica_rest_node_pheno34_april2021.zip"),
+                                  snp_col="SNP", beta_col="BETA", se_col="SE", effect_allele_col="A1", 
+                                  other_allele_col="A2",
+                                eaf_col = "AF1", pval_col = "P",  sep="\t")
+
+outcome_data <- read_outcome_data(file="finngen_R9_F5_ALZHDEMENT.gz",
+                                    snp_col="rsids", beta_col="beta", se_col="sebeta", effect_allele_col="alt", 
+                                    other_allele_col="ref", pval_col = "pval", sep="\t")
+exposure_data<-subset(exposure_data,pval.exposure<5e-08)
+
+# Clumping
+
+  {
+    ld_clump_local_YT=function(dat, clump_kb, clump_r2, clump_p, bfile, plink_bin) {
+      #debug:
+      # dat= data.frame(rsid=exposure$SNP, 
+      #                     pval=exposure$pval.exposure, 
+      #                     id=exposure$id.exposure)
+      # .....................
+      shell <- ifelse(Sys.info()["sysname"] == "Windows", "cmd", 
+                      "sh")
+      
+      fn <- tempfile()
+      
+      write.table(data.frame(SNP = dat[["rsid"]], P = dat[["pval"]]), 
+                  file = fn, row.names = F, col.names = T, quote = F)
+      
+      fun2 <- paste0(shQuote(plink_bin, type = shell), " --bfile ",
+                     shQuote(bfile, type = shell), " --clump ",
+                     shQuote(fn,type = shell), " --clump-p1 ", clump_p, " --clump-r2 ",
+                     clump_r2, " --clump-kb ", clump_kb, " --out ",
+                     shQuote(fn,type = shell))
+      
+      system(fun2)
+      
+      #if ######.clumped exists
+      if(file.exists(paste(fn, ".clumped", sep = ""))){
+        res <- read.table(paste(fn, ".clumped", sep = ""), header = T)
+        y <- subset(dat, !dat[["rsid"]] %in% res[["SNP"]])
+        if (nrow(y) > 0) {
+          message("Removing ", length(y[["rsid"]]), " of ", nrow(dat), 
+                  " variants due to LD with other variants or absence from LD reference panel")
+        }
+        unlink(paste(fn, "*", sep = ""))
+        return(subset(dat, dat[["rsid"]] %in% res[["SNP"]]))
+      }else{ #does not exists clumped data
+        return(dat)
+      }
+    }
+    
+    ld_clump_YT=function (dat = NULL, clump_kb = 10000, clump_r2 = 0.001, clump_p = 0.99, 
+                          pop = "EUR", access_token = NULL, bfile = NULL, plink_bin = NULL){
+      stopifnot("rsid" %in% names(dat))
+      stopifnot(is.data.frame(dat))
+      if (is.null(bfile)) {
+        message("Please look at vignettes for options on running this locally if you need to run many instances of this command.")
+      }
+      if (!"pval" %in% names(dat)) {
+        if ("p" %in% names(dat)) {
+          warning("No 'pval' column found in dat object. Using 'p' column.")
+          dat[["pval"]] <- dat[["p"]]
+        }
+        else {
+          warning("No 'pval' column found in dat object. Setting p-values for all SNPs to clump_p parameter.")
+          dat[["pval"]] <- clump_p
+        }
+      }
+      if (!"id" %in% names(dat)) {
+        dat$id <- random_string(1)
+      }
+      if (is.null(bfile)) {
+        access_token = check_access_token()
+      }
+      ids <- unique(dat[["id"]])
+      res <- list()
+      for (i in 1:length(ids)) {
+        x <- subset(dat, dat[["id"]] == ids[i])
+        if (nrow(x) == 1) {
+          message("Only one SNP for ", ids[i])
+          res[[i]] <- x
+        }
+        else {
+          message("Clumping ", ids[i], ", ", nrow(x), " variants, using ", 
+                  pop, " population reference")
+          if (is.null(bfile)) {
+            res[[i]] <- ld_clump_api(x, clump_kb = clump_kb, 
+                                     clump_r2 = clump_r2, clump_p = clump_p, pop = pop, 
+                                     access_token = access_token)
+          }
+          else {
+            res[[i]] <- ld_clump_local_YT(x, clump_kb = clump_kb, 
+                                          clump_r2 = clump_r2, clump_p = clump_p, bfile = bfile, 
+                                          plink_bin = plink_bin)
+          }
+        }
+      }
+      res <- dplyr::bind_rows(res)
+      return(res)
+    }}
+  
+  exp <-ld_clump(
+ 
+  dat = tibble(rsid = exposure_data$SNP, 
+               pval = exposure_data$pval.exposure,  
+               id = exposure_data$exposure),  
+  clump_kb = 1000,     
+  clump_r2 = 0.001,     
+  clump_p = 1,          
+  bfile = "......1kg.v3/EUR",       
+  plink_bin = "......plink_win64_20240804/plink" 
+)
+  exp <- exposure_data %>% filter(exposure_data$SNP %in% exp$rsid)
+  
+
+# Harmonization
+dat <- harmonise_data(exp, outcome_data)
+dat <- dat[which(dat$mr_keep==TRUE),]
+
+# test outliers by using ivw_radial
+outlier <- ivw_radial(dat)
+
+# remove outliers
+outliers <- outlier$outliers
+dat <- dat[which(!(dat$SNP %in% outliers$SNP)),]
+
+## Horizontal_pleiotropy by using MR_PRESSO
+dat_pleio <- mr_presso(BetaOutcome="beta.outcome",BetaExposure="beta.exposure",
+        SdOutcome="se.outcome",SdExposure="se.exposure",data = dat,OUTLIERtest = TRUE)
+# remove pleiotropic SNP
+dat_pleio$`MR-PRESSO results`$`Outlier Test`$name <- rownames(dat_pleio$`MR-PRESSO results`$`Outlier Test`)
+data1 <- subset(dat_pleio$`MR-PRESSO results`$`Outlier Test`, dat_pleio$`MR-PRESSO results`$`Outlier Test`$Pvalue>0.05)
+data <- dat[data1$name,]
+
+# F-statistic
+# r2 is the proportion of variance in the phenotype explained by the genetic variants
+# N is the sample size
+data$r2 <- data$BETA*data$BETA/(data$BETA*data$BETA+data$SE*data$SE*data$N)
+F_data <- merge(dat, data, by = "SNP")
+k <- nrow(F_data)		# the number of instruments
+
+# Calculating the F-statistic
+F_data$f <- sum(F_data$r2)*(F_data$N-k-1)/k*(1-sum(F_data$r2))
+
+# Performing Mendelian randomization analyses
+res <- mr(dat, method_list = c("mr_ivw_mre", "mr_raps", 
+	"mr_weighted_median","mr_weighted_mode", "mr_egger_regression"))
+
+# Transform beta as odd ratios
+res <- generate_odds_ratios(res)
+
+het <- mr_heterogeneity(dat)		#heterogeneity test
+
+pleio <- mr_pleiotropy_test(dat)	#pleiotropy test
+
+plot1 <- mr_scatter_plot(res, dat)	#scatter plot
+res_single <- mr_singlesnp(dat)		#The effect of single SNP on outcome
+plot2 <- mr_forest_plot(res_single)	#Forest plot of single SNP effect size
+plot3 <- mr_funnel_plot(res_single)	#Funnel plot
+single <- mr_leaveoneout(dat)		#leave-one-out sensitivity analysis
+plot4 <- mr_leaveoneout_plot(single)	#Forest plot of leave-one-out sensitivity analysis
